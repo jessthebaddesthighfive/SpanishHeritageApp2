@@ -1,7 +1,10 @@
-
 # app.py
-# Streamlit app for polynomial regression and function analysis using World Bank data
-# Place this file at the repository root alongside the 'requirements' file and deploy to Streamlit.
+# Streamlit app: polynomial regression & function analysis on World Bank time series
+# Author: (generated)
+# Notes:
+# - Fetches World Bank indicators at runtime (requires internet on Streamlit server).
+# - Uses indicators (see indicator_map below). Most World Bank WDI indicators have data from 1960 onwards.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,411 +14,446 @@ from sklearn.linear_model import LinearRegression
 import plotly.graph_objs as go
 from datetime import datetime
 import io
+import base64
 
-st.set_page_config(layout="wide", page_title="Latin Countries Regression & Function Analysis")
+st.set_page_config(layout="wide", page_title="Latin Countries — Regression & Function Analysis")
 
-st.title("Latin Countries — Regression & Function Analysis")
-st.markdown("""
-This app fetches historical data (World Bank API) for selected Latin American countries and fits a polynomial regression (degree ≥ 3).
-Features:
-- Choose up to 3 countries from a curated list.
-- Choose category (Population, Life expectancy, Birth rate, Unemployment, Education mapped 0-25, Average income).
-- Editable raw data table.
-- Fit a polynomial (degree ≥ 3) and display equation.
-- Plot data, fitted curve, and optional extrapolation (different color).
-- Function analysis: local extrema, monotonic intervals, fastest growth/decline, domain & range (interpreted using real-world units).
-- Compare multiple countries or upload your own CSV of U.S. Latin-group series for comparison.
-- Download raw data CSV and printer-friendly HTML report.
-""")
+st.title("Regression & Function Analysis for selected Latin American countries")
+st.markdown(
+    """
+This app fetches historical data (World Bank / Our World in Data) and fits a polynomial regression (degree ≥ 3).
+- Choose countries and category.
+- Edit the data table if needed.
+- Compare multiple countries or upload your own US-Latin-group CSV to compare diaspora groups.
+- Extrapolate into the future; extrapolated curve is shown in a different color.
+"""
+)
 
 # ---------------------
-# Configuration
+# Configuration / indicators
 # ---------------------
-# Up to 3 wealthier Latin American countries with good WDI coverage
+# Country list: three wealthy Latin countries (ISO2 codes)
 COUNTRIES = {
     "Chile": "CL",
     "Uruguay": "UY",
-    "Panama": "PA",
-    "Costa Rica": "CR",
-    "Argentina": "AR"
+    "Panama": "PA"
 }
 
-# Map app categories to World Bank indicators (WDI codes)
-INDICATORS = {
-    "Population": ("SP.POP.TOTL", "people"),
-    "Life expectancy": ("SP.DYN.LE00.IN", "years"),
-    "Birth rate (per 1000 people)": ("SP.DYN.CBRT.IN", "births per 1000 people"),
-    "Average income (GDP per capita, current US$)": ("NY.GDP.PCAP.CD", "current US$"),
-    "Murder rate (homicides per 100k)": ("VC.IHR.PSRC.P5", "deaths per 100k"),
-    "Unemployment rate (%)": ("SL.UEM.TOTL.ZS", "percent"),
-    "Education (mapped 0-25)": ("SE.SCH.LIFE", "years (mapped 0-25)")
+# World Bank indicator codes used in this app (common WDI codes)
+indicator_map = {
+    "Population": "SP.POP.TOTL",
+    "Life expectancy": "SP.DYN.LE00.IN",
+    "Birth rate": "SP.DYN.CBRT.IN",          # crude births per 1000
+    "Average income (GDP per capita, current US$)": "NY.GDP.PCAP.CD",
+    "Murder rate (intentional homicides per 100k)": "VC.IHR.PSRC.P5",
+    "Unemployment rate (total, % of labor force)": "SL.UEM.TOTL.ZS",
+    "Education (mean/expected years -> mapped 0-25)": "SE.SCH.LIFE"  # expected years of schooling (used as proxy)
 }
 
-MIN_YEAR = 1950  # we will warn if data before 1960 may be incomplete; WDI usually from 1960
-DEFAULT_START = 1960
-NOW_YEAR = datetime.now().year
+# Years range: we default to 1960 onwards because many WDI series begin there
+DEFAULT_START_YEAR = 1960
+DEFAULT_END_YEAR = datetime.now().year  # e.g., 2025 on the host server
 
-# ---------------------
-# Sidebar controls
-# ---------------------
-st.sidebar.header("Selection")
-selected_countries = st.sidebar.multiselect("Choose 1–3 countries:", list(COUNTRIES.keys()), default=["Chile", "Uruguay"])
-if len(selected_countries) == 0:
-    st.sidebar.error("Select at least one country.")
-    st.stop()
-if len(selected_countries) > 3:
-    st.sidebar.warning("Limiting to first three countries.")
-    selected_countries = selected_countries[:3]
-
-category = st.sidebar.selectbox("Category:", list(INDICATORS.keys()), index=0)
-indicator_code, units_desc = INDICATORS[category]
-
-start_year = st.sidebar.number_input("Start year (≥ 1950):", min_value=MIN_YEAR, max_value=NOW_YEAR, value=DEFAULT_START, step=1)
-end_year = st.sidebar.number_input("End year:", min_value=MIN_YEAR, max_value=NOW_YEAR, value=NOW_YEAR, step=1)
-if start_year >= end_year:
-    st.sidebar.error("Start year must be less than end year.")
+# UI: country selection (single or multiple)
+st.sidebar.header("Data selection")
+multiselect_countries = st.sidebar.multiselect("Choose 1–3 countries (World Bank data fetched at runtime):",
+                                              options=list(COUNTRIES.keys()),
+                                              default=["Chile"])
+if len(multiselect_countries) == 0:
+    st.sidebar.error("Pick at least one country to continue.")
     st.stop()
 
-year_increment = st.sidebar.slider("Plot resolution (years per point)", 1, 10, 1)
-degree = st.sidebar.slider("Polynomial degree (>=3)", 3, 8, 3)
-extrap_years = st.sidebar.number_input("Extrapolate forward (years)", min_value=0, max_value=100, value=0, step=1)
-show_extrap = st.sidebar.checkbox("Show extrapolated portion in dashed line", value=True)
-compare_diaspora = st.sidebar.checkbox("Compare with U.S. Latin-group data (upload CSV)", value=False)
-download_report = st.sidebar.checkbox("Show download buttons for report & data", value=True)
+category = st.sidebar.selectbox("Category (select one):", list(indicator_map.keys()), index=0)
+
+start_year = st.sidebar.number_input("Start year (earliest allowed 1960):", min_value=1950, max_value=DEFAULT_END_YEAR,
+                                     value=DEFAULT_START_YEAR, step=1)
+if start_year < 1960:
+    st.sidebar.caption("Note: most World Bank time series begin 1960; earlier years may be missing.")
+
+end_year = st.sidebar.number_input("End year:", min_value=1960, max_value=DEFAULT_END_YEAR,
+                                   value=DEFAULT_END_YEAR, step=1)
+
+year_increment = st.sidebar.slider("Plot resolution (years between plotted points)", min_value=1, max_value=10, value=1)
+
+# polynomial degree (must be >= 3)
+degree = st.sidebar.slider("Polynomial degree (≥ 3):", min_value=3, max_value=8, value=3)
+
+# extrapolation options
+extrapolate_years = st.sidebar.number_input("Extrapolate forward (years):", min_value=0, max_value=100, value=0, step=1)
+extrapolate_show = st.sidebar.checkbox("Show extrapolated portion", value=True)
+
+# multiple overlay / compare diaspora
+compare_multiple = st.sidebar.checkbox("Overlay multiple countries on same graph", value=True)
+compare_diaspora = st.sidebar.checkbox("Compare with Latin groups in the U.S. (upload CSV)", value=False)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("Data source: World Bank (WDI). Some series begin in 1960; missing values will appear as blank.")
+st.sidebar.markdown("Data source: World Bank (WDI), Our World in Data for schooling where necessary. App fetches data live.")
 
-# ---------------------
-# Functions to fetch and prepare data
-# ---------------------
-@st.cache_data(show_spinner=False)
-def fetch_wb_series(country_iso2, indicator, start, end):
+# helper: fetch WDI series for a country code
+def fetch_worldbank_series(country_iso2, indicator, start=1960, end=DEFAULT_END_YEAR):
+    # World Bank API v2: /country/{country}/indicator/{indicator}?date={start}:{end}&format=json&per_page=2000
     url = f"https://api.worldbank.org/v2/country/{country_iso2}/indicator/{indicator}?date={start}:{end}&format=json&per_page=20000"
     r = requests.get(url, timeout=30)
     if r.status_code != 200:
+        st.error(f"World Bank API error: status {r.status_code} for {country_iso2}, {indicator}")
         return pd.Series(dtype=float)
     try:
         data = r.json()
-    except Exception:
+    except Exception as e:
+        st.error(f"Could not parse World Bank response: {e}")
         return pd.Series(dtype=float)
     if not isinstance(data, list) or len(data) < 2:
         return pd.Series(dtype=float)
     entries = data[1]
     rows = []
     for e in entries:
-        y = e.get("date")
-        v = e.get("value")
-        if v is not None:
+        year = e.get("date")
+        val = e.get("value")
+        if val is not None:
             try:
-                rows.append((int(y), float(v)))
+                rows.append((int(year), float(val)))
             except:
                 continue
     if not rows:
         return pd.Series(dtype=float)
-    df = pd.DataFrame(rows, columns=["year", "value"]).set_index("year").sort_index()
+    df = pd.DataFrame(rows, columns=["year", "value"]).sort_values("year").set_index("year")
     return df["value"]
 
-def map_education_to_025(series):
-    # The indicator SE.SCH.LIFE is expected years of schooling; map to 0-25 scale linearly (25 as max)
-    return (series / 25.0) * 25.0
+# fetch datasets for selected countries
+@st.cache_data(show_spinner=False)
+def get_data_for_countries(countries, indicator_code, start, end):
+    out = {}
+    for c in countries:
+        iso = COUNTRIES[c]
+        s = fetch_worldbank_series(iso, indicator_code, start, end)
+        out[c] = s
+    return out
 
-def assemble_data_table(country_series_dict, start, end, category):
-    years = list(range(start, end+1))
-    df = pd.DataFrame({"year": years})
-    for country, series in country_series_dict.items():
-        s_full = series.reindex(years)
-        if category == "Education (mapped 0-25)":
+indicator_code = indicator_map[category]
+with st.spinner("Fetching data from World Bank..."):
+    raw_country_series = get_data_for_countries(multiselect_countries, indicator_code, start_year, end_year)
+
+# transform education to 0-25 scale if needed
+def map_education_to_025(series):
+    # series is expected years of schooling (or similar). We'll map linearly to 0-25 by assuming 25 years is max schooling.
+    # Many countries have expected years < 20; mapping preserves relative shape.
+    max_years = 25.0
+    mapped = (series / max_years) * 25.0
+    return mapped
+
+# assemble DataFrame for editing
+def assemble_table(series_dict):
+    df = pd.DataFrame(index=range(start_year, end_year + 1))
+    for country, s in series_dict.items():
+        # reindex to complete year range and keep NaNs where missing
+        s_full = s.reindex(range(start_year, end_year + 1))
+        if category == "Education (mean/expected years -> mapped 0-25)":
             s_full = map_education_to_025(s_full)
-        df[country] = s_full.values
+        # column name: country (category units)
+        df[country] = s_full
+    df.index.name = "year"
+    df = df.reset_index()
     return df
 
-# Fetch data
-with st.spinner("Fetching data from World Bank..."):
-    raw_series = {}
-    for c in selected_countries:
-        iso = COUNTRIES[c]
-        s = fetch_wb_series(iso, indicator_code, start_year, end_year)
-        raw_series[c] = s
-
-data_df = assemble_data_table(raw_series, start_year, end_year, category)
+data_table = assemble_table(raw_country_series)
 
 st.header("Raw data (editable)")
-st.write("Edit values in the table if you want to correct or add numbers. Press the 'Update model' button to re-fit models with edits.")
+st.write("You can edit values directly in the table — the regression will update when you press 'Update model'.")
 
-edited = st.experimental_data_editor(data_df, num_rows="dynamic")
-st.write("Edited table preview (you can download CSV below).")
+# editable table (Streamlit's experimental data editor)
+edited = st.experimental_data_editor(data_table, num_rows="dynamic")
 
-# Download CSV
-csv_bytes = edited.to_csv(index=False).encode("utf-8")
-if download_report:
-    st.download_button("Download edited data (CSV)", csv_bytes, file_name="edited_time_series.csv", mime="text/csv")
+# allow the user to download the raw data CSV
+csv_bytes = edited.to_csv(index=False).encode()
+st.download_button("Download data CSV", data=csv_bytes, file_name="raw_time_series.csv", mime="text/csv")
 
-# ---------------------
-# Modeling helpers
-# ---------------------
-def prepare_xy(edited_df, country):
-    df = edited_df[["year", country]].dropna()
+# prepare numeric arrays for modeling per country
+def prepare_xy_from_table(edited_df, country, dropna=True):
+    df = edited_df[["year", country]].copy()
+    if dropna:
+        df = df.dropna(subset=[country])
     if df.empty:
         return np.array([]), np.array([])
-    x = df["year"].to_numpy(dtype=float)
-    y = df[country].to_numpy(dtype=float)
+    x = df["year"].astype(float).to_numpy()
+    y = df[country].astype(float).to_numpy()
     return x, y
 
-def fit_poly(x, y, deg):
-    # center x to improve numeric stability
-    xm = x.mean()
-    x_center = x - xm
-    coeffs = np.polyfit(x_center, y, deg)
-    p = np.poly1d(coeffs)
-    return {"poly": p, "x_mean": xm, "x": x, "y": y}
+# polynomial fit and analysis
+def fit_polynomial(x, y, deg):
+    # map years to a smaller scale to improve conditioning (e.g., subtract baseline)
+    if x.size == 0:
+        return None
+    x0 = x - x.mean()
+    pf = PolynomialFeatures(degree=deg, include_bias=True)
+    Xp = pf.fit_transform(x0.reshape(-1,1))
+    lr = LinearRegression()
+    lr.fit(Xp, y)
+    coeffs = lr.coef_.copy()
+    coeffs[0] = lr.intercept_  # combine intercept
+    # But sklearn stores intercept separately; instead construct polynomial coefficients in usual order:
+    # We can get polynomial coefficients via numpy.polyfit on scaled variable for simplicity and clarity:
+    p_coeffs = np.polyfit(x0, y, deg)
+    # p_coeffs has highest degree first
+    return {
+        "poly": np.poly1d(p_coeffs),
+        "x_mean": x.mean(),
+        "x_original": x,
+        "y_original": y
+    }
 
-def function_analysis(model):
-    p = model["poly"]
-    xm = model["x_mean"]
+# function analysis helpers (derivatives, critical points)
+def function_analysis(poly_obj):
+    p = poly_obj["poly"]
+    xmean = poly_obj["x_mean"]
+    # derivative and second derivative polynomials
     dp = np.polyder(p)
     ddp = np.polyder(dp)
-    # critical points: real roots of dp
-    crit_roots = np.roots(dp)
-    crit_real = crit_roots[np.isclose(crit_roots.imag, 0, atol=1e-6)].real
+    # find critical points: real roots of dp
+    crit = np.roots(dp)
+    real_crit = np.real(crit[np.isclose(np.imag(crit), 0, atol=1e-6)])
+    # evaluate second derivative at real critical points
     crit_info = []
-    for r in crit_real:
-        year_full = r + xm
-        conc = ddp(r)
-        typ = "inflection/flat"
-        if conc > 0:
+    for rc in real_crit:
+        second_val = ddp(rc)
+        # classify
+        if second_val > 0:
             typ = "local minimum"
-        elif conc < 0:
+        elif second_val < 0:
             typ = "local maximum"
-        crit_info.append({"year_rel": float(r), "year": float(year_full), "second_derivative": float(conc), "type": typ})
-    return {"dp": dp, "ddp": ddp, "crit": crit_info}
+        else:
+            typ = "inflection/flat"
+        crit_info.append((rc + xmean, rc, second_val, typ))  # rc is relative; convert to original year by +xmean
+    # where increasing/decreasing: evaluate dp sign across domain sample
+    return {"dp": dp, "ddp": ddp, "critical": crit_info}
 
-# Fit models for selected countries
+# build model for each selected country and plot
+st.header("Modeling & Graph")
+
+plot_countries = multiselect_countries if compare_multiple else [multiselect_countries[0]]
+
 models = {}
-for c in selected_countries:
-    x, y = prepare_xy(edited, c)
+for c in plot_countries:
+    x, y = prepare_xy_from_table(edited, c)
     if x.size == 0:
-        st.warning(f"No data points for {c}. Skipping model.")
+        st.warning(f"No data available for {c}; cannot fit model.")
         continue
-    model = fit_poly(x, y, degree)
+    model = fit_polynomial(x, y, degree)
+    if model is None:
+        st.warning(f"Could not fit polynomial for {c}.")
+        continue
     models[c] = model
 
+# prepare x grid for plotting (including extrapolation)
 if not models:
     st.stop()
 
-# ---------------------
-# Plotting
-# ---------------------
-st.header("Scatter plot with polynomial fit")
-# determine common plotting grid
-min_year = min([m["x"].min() for m in models.values()])
-max_year = max([m["x"].max() for m in models.values()])
-plot_end = max_year + extrap_years
-x_plot = np.arange(min_year, plot_end+1, year_increment)
+# Determine global x range for plotted data
+min_x = min([m["x_original"].min() for m in models.values()])
+max_x = max([m["x_original"].max() for m in models.values()])
 
+plot_end_year = max_x + extrapolate_years
+x_grid = np.arange(min_x, plot_end_year + 1, year_increment)
+# use scaled x for evaluation: subtract x_mean for each model separately when evaluating
 fig = go.Figure()
-palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b"]
-
+colors = ["blue", "green", "red", "orange", "purple"]
 for i, (country, model) in enumerate(models.items()):
-    color = palette[i % len(palette)]
-    # scatter
-    fig.add_trace(go.Scatter(x=model["x"], y=model["y"], mode="markers", name=f"{country} data", marker=dict(color=color)))
-    # fitted curve on observed range
+    # scatter original points
+    fig.add_trace(go.Scatter(
+        x=model["x_original"],
+        y=model["y_original"],
+        mode="markers",
+        name=f"{country} data",
+        marker=dict(size=6, color=colors[i % len(colors)])
+    ))
+    # compute fitted y over data range and extrapolation
     xm = model["x_mean"]
-    x_rel = x_plot - xm
-    y_fit = model["poly"](x_rel)
-    # separate observed vs extrapolated for this country
-    mask_observed = x_plot <= model["x"].max()
-    fig.add_trace(go.Scatter(x=x_plot[mask_observed], y=y_fit[mask_observed], mode="lines", name=f"{country} fit (observed)", line=dict(color=color, width=2)))
-    # extrapolated portion
-    if extrap_years > 0 and show_extrap:
-        mask_extra = x_plot > model["x"].max()
-        if mask_extra.any():
-            fig.add_trace(go.Scatter(x=x_plot[mask_extra], y=y_fit[mask_extra], mode="lines", name=f"{country} extrapolated", line=dict(color=color, width=2, dash="dash")))
+    p = model["poly"]
+    # evaluate on grid relative to the model's x_mean:
+    x_rel = x_grid - xm
+    y_fit = p(x_rel)
+    # split into fitted (within original data) and extrapolated portion
+    mask_extrap = x_grid > model["x_original"].max()
+    # add fitted portion
+    fig.add_trace(go.Scatter(
+        x=x_grid[~mask_extrap],
+        y=y_fit[~mask_extrap],
+        mode="lines",
+        name=f"{country} fit (observed-range)",
+        line=dict(width=2, dash="solid", color=colors[i % len(colors)])
+    ))
+    # add extrapolated portion in distinct style if requested
+    if extrapolate_years > 0 and extrapolate_show:
+        fig.add_trace(go.Scatter(
+            x=x_grid[mask_extrap],
+            y=y_fit[mask_extrap],
+            mode="lines",
+            name=f"{country} extrapolated",
+            line=dict(width=2, dash="dash", color=colors[i % len(colors)]),
+            hovertemplate="(extrapolated)"
+        ))
 
-fig.update_layout(title=f"{category} — data and polynomial fit (degree {degree})", xaxis_title="Year", yaxis_title=f"{category} ({units_desc})", height=600)
+fig.update_layout(title=f"{category} — data and polynomial fit (degree {degree})",
+                  xaxis_title="Year",
+                  yaxis_title=category,
+                  height=600)
+
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------
-# Equations and analysis
-# ---------------------
-st.header("Model equations & function analysis (plain-English interpretation)")
-
+# show equation of the model(s)
+st.subheader("Model equation(s) and function analysis")
 for country, model in models.items():
-    st.subheader(country)
     p = model["poly"]
+    # present polynomial coefficients with year variable as (year - mean)
     xm = model["x_mean"]
-    # readable equation in variable t = year - xm
-    coeffs = p.coeffs
-    deg_p = len(coeffs)-1
+    coeffs = p.coeffs  # highest-first
+    # create readable equation string (year variable as t = (year - xm))
     terms = []
+    deg_p = len(coeffs) - 1
     for idx, coef in enumerate(coeffs):
-        power = deg_p - idx
-        if power == 0:
-            terms.append(f"{coef:.6g}")
-        elif power == 1:
-            terms.append(f"{coef:.6g}*(year - {xm:.1f})")
+        pow = deg_p - idx
+        coef_str = f"{coef:.6g}"
+        if pow == 0:
+            terms.append(f"{coef_str}")
+        elif pow == 1:
+            terms.append(f"{coef_str}*(year - {xm:.1f})")
         else:
-            terms.append(f"{coef:.6g}*(year - {xm:.1f})^{power}")
-    eq = " + ".join(terms)
-    st.code(f"y = {eq}", language="text")
+            terms.append(f"{coef_str}*(year - {xm:.1f})^{pow}")
+    eqn = " + ".join(terms)
+    st.markdown(f"**{country}** — polynomial (in variable `year - {xm:.1f}`):  ")
+    st.code(f"y = {eqn}", language="text")
 
     # function analysis
     fa = function_analysis(model)
-    crit = fa["crit"]
-    if crit:
-        st.write("Critical points (from polynomial derivative roots):")
-        for item in crit:
-            yr = item["year"]
-            typ = item["type"]
-            dd = item["second_derivative"]
-            # format explanatory sentence
-            st.write(f"- The {category.lower()} of {country} reached a {typ} around **{yr:.2f}**. (second derivative ≈ {dd:.3g})")
+    critical = fa["critical"]
+    if critical:
+        st.markdown(f"**Critical points (converted to calendar years)** for {country}:")
+        for rc_full, rc_rel, ddval, typ in critical:
+            # rc_full is float year; convert to nearest date string (year + fraction -> approximate month/day)
+            year_int = int(np.floor(rc_full))
+            month = 1
+            day = 1
+            try:
+                date_str = f"{year_int}-01-01"
+            except:
+                date_str = f"{rc_full:.2f}"
+            st.write(f"- {typ.title()} at year ≈ **{rc_full:.2f}** (interpreted as around {date_str}); second derivative = {ddval:.3g}")
     else:
-        st.write("No real critical points found for this model.")
+        st.write(f"No real critical points found for {country} (in the polynomial derivative roots).")
 
-    # increasing / decreasing (sample derivative sign on a grid)
+    # increasing/decreasing intervals (sample dp sign across wide grid)
     dp = fa["dp"]
-    sample_x = np.linspace(min_year-5, max_year+5+extrap_years, 400)
+    sample_x = np.linspace(min_x - 5, max_x + 5 + extrapolate_years, 400)
     dp_vals = dp(sample_x - xm)
-    inc_intervals = []
-    dec_intervals = []
-    sign = None
-    start_interval = None
-    for xi, val in zip(sample_x, dp_vals):
-        sgn = np.sign(val)
-        if sign is None:
-            sign = sgn
-            start_interval = xi
-        elif sgn != sign:
-            if sign > 0:
-                inc_intervals.append((start_interval, xi))
-            elif sign < 0:
-                dec_intervals.append((start_interval, xi))
-            sign = sgn
-            start_interval = xi
-    # close last
-    if sign is not None:
-        if sign > 0:
-            inc_intervals.append((start_interval, sample_x[-1]))
-        elif sign < 0:
-            dec_intervals.append((start_interval, sample_x[-1]))
+    # find sign changes
+    inc_regions = []
+    dec_regions = []
+    current_sign = None
+    region_start = None
+    for xi, dpi in zip(sample_x, dp_vals):
+        sign = np.sign(dpi)
+        if current_sign is None:
+            current_sign = sign
+            region_start = xi
+        elif sign != current_sign:
+            # close region
+            if current_sign > 0:
+                inc_regions.append((region_start, xi))
+            elif current_sign < 0:
+                dec_regions.append((region_start, xi))
+            current_sign = sign
+            region_start = xi
+    # close last region
+    if current_sign is not None:
+        if current_sign > 0:
+            inc_regions.append((region_start, sample_x[-1]))
+        elif current_sign < 0:
+            dec_regions.append((region_start, sample_x[-1]))
 
-    def fmt(regs):
-        if not regs:
-            return "None identified (approx)"
-        return ", ".join([f"[{r[0]:.1f}, {r[1]:.1f}]" for r in regs])
+    def fmt_regions(regs):
+        return ", ".join([f"[{r[0]:.1f}, {r[1]:.1f}]" for r in regs]) if regs else "None identified"
 
-    st.write(f"- Intervals where model is increasing (approx): {fmt(inc_intervals)}")
-    st.write(f("- Intervals where model is decreasing (approx): {fmt(dec_intervals)}")
+    st.write(f"- Intervals where the fitted function is increasing (approx): {fmt_regions(inc_regions)}")
+    st.write(f"- Intervals where the fitted function is decreasing (approx): {fmt_regions(dec_regions)}")
 
-    # fastest change via second derivative maxima/minima
+    # where increasing/decreasing fastest: maxima/minima of derivative magnitude or where second derivative is largest magnitude
     ddp = fa["ddp"]
     dd_vals = ddp(sample_x - xm)
-    idx_max = np.argmax(dd_vals)
-    idx_min = np.argmin(dd_vals)
-    st.write(f"- The {category.lower()} was increasing fastest around year ≈ **{sample_x[idx_max]:.2f}**.")
-    st.write(f("- The {category.lower()} was decreasing fastest around year ≈ **{sample_x[idx_min]:.2f}**.")
+    idx_max_pos = np.argmax(dd_vals)
+    idx_min_pos = np.argmin(dd_vals)
+    fastest_inc_year = sample_x[idx_max_pos]
+    fastest_dec_year = sample_x[idx_min_pos]
+    st.write(f"- The function is increasing fastest around year ≈ **{fastest_inc_year:.2f}**.")
+    st.write(f"- The function is decreasing fastest around year ≈ **{fastest_dec_year:.2f}**.")
 
-    # domain & range (approx)
-    y_sample = p(sample_x - xm)
-    st.write(f"- Analysis domain (approx): [{sample_x[0]:.1f}, {sample_x[-1]:.1f}]")
-    st.write(f"- Approximate range on analyzed domain: [{np.nanmin(y_sample):.3g}, {np.nanmax(y_sample):.3g}]")
+    # domain & range (numerical)
+    domain_str = f"[{sample_x[0]:.1f}, {sample_x[-1]:.1f}] (analysis sampling)"
+    y_vals_sample = p(sample_x - xm)
+    range_str = f"[{float(np.nanmin(y_vals_sample)):.3g}, {float(np.nanmax(y_vals_sample)):.3g}] (approx from sample)"
+    st.write(f"- Domain used for analysis (approx): {domain_str}")
+    st.write(f"- Approximate range of fitted function over that domain: {range_str}")
 
-    # conjectures: simple heuristic based on big changes (user must verify historically)
-    if len(model["x"]) >= 3:
-        obs_df = pd.DataFrame({"year": model["x"], "value": model["y"]}).sort_values("year")
-        obs_df["pct_change"] = obs_df["value"].pct_change().abs()
-        top = obs_df.sort_values("pct_change", ascending=False).head(3)
-        st.write("- Notable observed changes (largest year-to-year percent change):")
-        for _, row in top.iterrows():
-            if pd.isna(row["pct_change"]):
-                continue
-            st.write(f"  - Around **{int(row['year'])}** change of {row['pct_change']*100:.1f}% — consider researching events (policy, economy, conflict, pandemic) that may explain this.")
     st.markdown("---")
 
-# ---------------------
-# Interpolation / Extrapolation & average rate of change
-# ---------------------
-st.header("Interpolation / Extrapolation and Average Rate of Change")
+# interpolation / extrapolation single-value prediction
+st.header("Interpolation / Extrapolation & Rates of Change")
+st.write("Enter a year to get the model prediction (interpolated or extrapolated).")
 
-pred_country = st.selectbox("Pick country for prediction:", options=list(models.keys()))
-pred_model = models[pred_country]
-pred_year = st.number_input("Year to evaluate (can be outside data):", value=int(pred_model["x"].max()), min_value=1900, max_value=2100, step=1)
-pred_val = pred_model["poly"](pred_year - pred_model["x_mean"])
-st.write(f"Model predicts for **{pred_country}** in **{pred_year}**: **{pred_val:.6g} {units_desc}**")
-if pred_year > pred_model["x"].max() or pred_year < pred_model["x"].min():
-    st.warning("This is an extrapolation (outside observed data). Use caution — uncertainty rising with distance from data.")
+pred_country = st.selectbox("Choose country for prediction:", options=list(models.keys()))
+pred_year = st.number_input("Year to predict (can be outside data range):", value=int(max_x), min_value=1900, max_value=2100, step=1)
+model = models[pred_country]
+p = model["poly"]
+xm = model["x_mean"]
+pred_val = p((pred_year - xm))
+st.write(f"Model prediction for **{pred_country}** in **{pred_year}**: **{pred_val:.4g}** (units = {category})")
+# say whether it's interpolation or extrapolation
+if pred_year > model["x_original"].max():
+    st.warning("This prediction is an extrapolation beyond the observed data. Extrapolations are uncertain and should be used with caution.")
+elif pred_year < model["x_original"].min():
+    st.warning("This prediction is an extrapolation before the observed data. Use caution.")
+else:
+    st.success("This is an interpolation (within observed data range).")
 
 # average rate of change between two years
-st.write("Average rate of change between two years (model-based):")
-yr_a = st.number_input("Year A:", value=int(pred_model["x"].min()), step=1, key="yrA")
-yr_b = st.number_input("Year B:", value=int(pred_model["x"].max()), step=1, key="yrB")
-if yr_a != yr_b:
-    val_a = pred_model["poly"](yr_a - pred_model["x_mean"])
-    val_b = pred_model["poly"](yr_b - pred_model["x_mean"])
-    avg_rate = (val_b - val_a) / (yr_b - yr_a)
-    st.write(f"- Average rate of change from {yr_a} to {yr_b}: **{avg_rate:.6g} {units_desc} per year**")
+st.write("Compute average rate of change of the model between two years:")
+y1 = st.number_input("Year A:", value=int(model["x_original"].min()), step=1)
+y2 = st.number_input("Year B:", value=int(model["x_original"].max()), step=1)
+if y2 == y1:
+    st.info("Pick two different years.")
 else:
-    st.info("Pick two different years to compute rate.")
+    valA = p((y1 - xm))
+    valB = p((y2 - xm))
+    avg_rate = (valB - valA) / (y2 - y1)
+    st.write(f"Average rate of change from {y1} to {y2}: **{avg_rate:.6g} {category} per year**")
+    st.write(f"Interpretation example: The {category.lower()} increased on average by {avg_rate:.3g} units per year between {y1} and {y2} according to the model.")
 
-# ---------------------
-# Compare with uploaded CSV (U.S. Latin groups)
-# ---------------------
-st.header("Compare with U.S. Latin-group data (optional upload)")
-st.write("Upload a CSV with columns: year, group_name1, group_name2, ... Year must be integer years.")
-uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
-if uploaded is not None:
-    try:
-        uploaded_df = pd.read_csv(uploaded)
-        if "year" not in uploaded_df.columns:
-            st.error("CSV must contain 'year' column.")
-        else:
-            st.write("Preview of uploaded CSV:")
-            st.dataframe(uploaded_df.head())
-            groups = [c for c in uploaded_df.columns if c != "year"]
-            chosen = st.multiselect("Choose groups to plot alongside countries:", options=groups)
-            if chosen:
-                fig2 = go.Figure()
-                for i, (country, model) in enumerate(models.items()):
-                    fig2.add_trace(go.Scatter(x=model["x"], y=model["y"], mode="markers", name=f"{country} data"))
-                    xm = model["x_mean"]
-                    x_rel = x_plot - xm
-                    y_fit = model["poly"](x_rel)
-                    fig2.add_trace(go.Scatter(x=x_plot, y=y_fit, mode="lines", name=f"{country} fit"))
-                for g in chosen:
-                    dfg = uploaded_df[["year", g]].dropna()
-                    fig2.add_trace(go.Scatter(x=dfg["year"], y=dfg[g], mode="lines+markers", name=g))
-                fig2.update_layout(title="Comparison with uploaded U.S. Latin-group data", xaxis_title="Year", yaxis_title=category)
-                st.plotly_chart(fig2, use_container_width=True)
-    except Exception as e:
-        st.error(f"Error reading uploaded CSV: {e}")
-
-# ---------------------
-# Printer-friendly HTML report
-# ---------------------
+# Printer-friendly report (simple HTML)
 st.header("Printer-friendly report")
-if st.button("Generate simple HTML report"):
+if st.button("Generate printer-friendly HTML"):
+    # Create a simple HTML report with the current plot and the model equations + function analysis text
     html_parts = []
-    html_parts.append(f"<h1>{category} — Regression & Function Analysis</h1>")
-    html_parts.append(f"<p>Countries: {', '.join(selected_countries)}</p>")
+    html_parts.append(f"<h1>{category} — Regression & Analysis</h1>")
+    html_parts.append(f"<p>Selected countries: {', '.join(plot_countries)}</p>")
     html_parts.append(f"<p>Polynomial degree: {degree}</p>")
+    # equations
     for country, model in models.items():
-        p = model["poly"]; xm = model["x_mean"]
-        coeffs = p.coeffs; deg_p = len(coeffs)-1
-        terms = []
+        p = model["poly"]
+        xm = model["x_mean"]
+        coeffs = p.coeffs
+        deg_p = len(coeffs) - 1
+        eqterms = []
         for idx, coef in enumerate(coeffs):
-            power = deg_p - idx
-            if power == 0:
-                terms.append(f"{coef:.6g}")
-            elif power == 1:
-                terms.append(f"{coef:.6g}*(year - {xm:.1f})")
+            pow = deg_p - idx
+            coef_str = f"{coef:.6g}"
+            if pow == 0:
+                eqterms.append(f"{coef_str}")
+            elif pow == 1:
+                eqterms.append(f"{coef_str}*(year - {xm:.1f})")
             else:
-                terms.append(f"{coef:.6g}*(year - {xm:.1f})^{power}")
-        eq = " + ".join(terms)
-        html_parts.append(f"<h2>{country}</h2><pre>y = {eq}</pre>")
-    html = "<html><body>" + "".join(html_parts) + "</body></html>"
-    st.download_button("Download report (HTML)", data=html.encode("utf-8"), file_name="report.html", mime="text/html")
+                eqterms.append(f"{coef_str}*(year - {xm:.1f})^{pow}")
+        eqn = " + ".join(eqterms)
+        html_parts.append(f"<h2>{country}</h2><pre>y = {eqn}</pre>")
+    html = "<html><body>" + "\n".join(html_parts) + "</body></html>"
+    st.download_button("Download HTML report", data=html.encode("utf-8"), file_name="report.html", mime="text/html")
 
-st.markdown("---")
-st.write("Notes: World Bank API is used. Many indicators start around 1960; complete 70-year historical coverage to 1955 may not be available for all indicators. The app maps 'Education' to a 0-25 scale by using expected years of schooling as a proxy and a linear mapping. Extrapolation is inherently uncertain — treat long-range predictions cautiously.")
+st.markdown("----")
+st.info("Notes & sources: Data are fetched from the World Bank API (WDI) and Our World in Data where noted. Many WDI series begin circa 1960. Extrapolations are model-based estimates and can diverge from real future outcomes.")
